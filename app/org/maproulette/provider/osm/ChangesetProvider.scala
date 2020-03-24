@@ -4,21 +4,38 @@ package org.maproulette.services.osm
 
 import javax.inject.{Inject, Singleton}
 import org.maproulette.Config
+import org.maproulette.models._
+import org.maproulette.session.User
+import org.maproulette.models.dal.DALManager
 import org.maproulette.exception.ChangeConflictException
+import play.shaded.oauth.oauth.signpost.exception.OAuthNotAuthorizedException
 import org.maproulette.services.osm.objects._
 import play.api.libs.oauth.{OAuthCalculator, RequestToken}
 import play.api.libs.ws.{WSClient, WSResponse}
 
+import java.sql.Connection
+import anorm.SqlParser._
+import anorm._
+import play.api.db.Database
+import org.maproulette.models.utils.TransactionManager
 import scala.collection.mutable
 import scala.concurrent.{Future, Promise}
 import scala.util.{Failure, Success}
-import scala.xml.Elem
+import scala.xml.{Elem, NodeSeq}
 
 /**
   * @author mcuthbert
   */
 @Singleton
-class ChangesetProvider @Inject()(ws: WSClient, nodeService: NodeProvider, wayService: WayProvider, relationService: RelationProvider, config: Config) {
+class ChangesetProvider @Inject() (
+    ws: WSClient,
+    nodeService: NodeProvider,
+    wayService: WayProvider,
+    relationService: RelationProvider,
+    config: Config,
+    dalManager: DALManager,
+    val db: Database
+) extends TransactionManager {
 
   import scala.concurrent.ExecutionContext.Implicits.global
 
@@ -26,7 +43,7 @@ class ChangesetProvider @Inject()(ws: WSClient, nodeService: NodeProvider, waySe
     val p = Promise[List[VersionedObject]]
     this.conflateTagChanges(tagChanges) onComplete {
       case Success(res) => p success res.map(_._1)
-      case Failure(f) => p failure f
+      case Failure(f)   => p failure f
     }
     p.future
   }
@@ -42,35 +59,63 @@ class ChangesetProvider @Inject()(ws: WSClient, nodeService: NodeProvider, waySe
     val p = Promise[List[TagChangeResult]]
     this.conflateTagChanges(tagChanges) onComplete {
       case Success(res) => p success res.map(_._2)
-      case Failure(f) => p failure f
+      case Failure(f)   => p failure f
     }
     p.future
   }
 
   /**
-    * Submit a set of tag changes to the OSM servers
+    * Submit a set of changes to the OSM servers
     *
-    * @param tagChanges       A list of TagChange objects to test changes with OSM objects
+    * @param changes       The changes to be submitted to OSM
     * @param changeSetComment The changeset comment to be associated with the change
     * @return future that will return the OSMChange that was submitted to the OSM servers
     */
-  def submitTagChange(tagChanges: List[TagChange], changeSetComment: String, accessToken: RequestToken): Future[Elem] = {
+  def submitOsmChange(
+      changes: OSMChange,
+      changeSetComment: String,
+      accessToken: RequestToken,
+      taskId: Option[Long] = None
+  )(implicit c: Option[Connection] = None): Future[Elem] = {
     val p = Promise[Elem]
     // create the new changeset
     this.createChangeset(changeSetComment, accessToken) onComplete {
       case Success(changesetId) =>
         // retrieve the current version of the osm feature
-        // conflate the current tags with the provided tags
-        this.getOsmChange(tagChanges, Some(changesetId)) onComplete {
+        // conflate the current tags with provided tags
+        this.getOsmChange(changes, Some(changesetId)) onComplete {
           case Success(res) =>
             // submit the conflated changes
             val url = s"${config.getOSMServer}/api/0.6/changeset/$changesetId/upload"
-            ws.url(url).sign(OAuthCalculator(config.getOSMOauth.consumerKey, accessToken)).post(res) onComplete {
+            ws.url(url)
+              .sign(OAuthCalculator(config.getOSMOauth.consumerKey, accessToken))
+              .post(res) onComplete {
               case Success(uploadResult) =>
                 uploadResult.status match {
-                  case ChangesetProvider.STATUS_OK => p success res
-                  case ChangesetProvider.STATUS_CONFLICT => p failure new ChangeConflictException(s"Conflict found in upload: ${uploadResult.body}. $res")
-                  case x => p failure new Exception(s"${url} failed with status code $x (${uploadResult.statusText}")
+                  case ChangesetProvider.STATUS_OK => {
+                    taskId match {
+                      case Some(tid) =>
+                        implicit val id: Long = tid
+                        dalManager.task.retrieveById(id) match {
+                          case Some(task) =>
+                            dalManager.task.mergeUpdate(
+                              task.copy(changesetId = Some(changesetId)),
+                              User.superUser
+                            )
+                          case _ => // do nothing
+                        }
+                      case _ => // do nothing
+                    }
+                    p success res
+                  }
+                  case ChangesetProvider.STATUS_CONFLICT =>
+                    p failure new ChangeConflictException(
+                      s"Conflict found in upload: ${uploadResult.body}. $res"
+                    )
+                  case x =>
+                    p failure new Exception(
+                      s"${url} failed with status code $x (${uploadResult.statusText}"
+                    )
                 }
                 this.closeChangeset(changesetId, accessToken)
               case Failure(f) =>
@@ -85,36 +130,70 @@ class ChangesetProvider @Inject()(ws: WSClient, nodeService: NodeProvider, waySe
   }
 
   /**
-    * Retrieves all the requested changes and returns a OsmChange XML object
+    * Returns a osmChange XML object for geometry changes
     *
-    * @param tagChanges A list of changes to process
-    * @return The OsmChange
+    * @param geometryChanges The geometry changes to process
+    * @return The osmChange XML
     */
-  def getOsmChange(tagChanges: List[TagChange], changeSetId: Option[Int] = None): Future[Elem] = {
-    val p = Promise[Elem]
-    this.conflateTagChanges(tagChanges) onComplete {
-      case Success(res) =>
-        val osmChange =
-          <osmChange version="0.6" generator="MapRoulette">
-            <modify>
+  def getOsmChange(change: OSMChange, changeSetId: Option[Int]): Future[Elem] = {
+    val changePromise = Promise[Elem]
+    val osmCreates = change.creates match {
+      case Some(creates) =>
+        <create>
+          {for (create <- creates) yield create.toCreateElement(changeSetId.getOrElse(-1))}
+        </create>
+      case None => NodeSeq.Empty
+    }
+
+    val updatesPromise = Promise[NodeSeq]
+    val osmUpdates = change.updates match {
+      case Some(updates) =>
+        // Only support tag changes for now
+        val tagChanges = updates.map(update => {
+          TagChange(
+            update.osmId,
+            update.osmType,
+            update.tags.updates,
+            update.tags.deletes,
+            update.version
+          )
+        })
+
+        this.conflateTagChanges(tagChanges) onComplete {
+          case Success(res) =>
+            updatesPromise success
+              <modify>
               {for (entity <- res) yield entity._1.toChangeElement(changeSetId.getOrElse(-1))}
             </modify>
-          </osmChange>
-        p success osmChange
-      case Failure(f) => p failure f
+          case Failure(f) => updatesPromise failure f
+        }
+      case None => updatesPromise success NodeSeq.Empty
     }
-    p.future
+
+    updatesPromise.future onComplete {
+      case Success(osmUpdates) =>
+        changePromise success
+          <osmChange version="0.6" generator="MapRoulette">
+          {osmCreates}
+          {osmUpdates}
+        </osmChange>
+      case Failure(f) => changePromise failure f
+    }
+
+    changePromise.future
   }
 
-  private def conflateTagChanges(tagChanges: List[TagChange]): Future[List[(VersionedObject, TagChangeResult)]] = {
-    val grouping = tagChanges.groupBy(_.osmType)
-    val nodes = grouping.getOrElse(OSMType.NODE, List.empty)
-    val ways = grouping.getOrElse(OSMType.WAY, List.empty)
+  private def conflateTagChanges(
+      tagChanges: List[TagChange]
+  ): Future[List[(VersionedObject, TagChangeResult)]] = {
+    val grouping  = tagChanges.groupBy(_.osmType)
+    val nodes     = grouping.getOrElse(OSMType.NODE, List.empty)
+    val ways      = grouping.getOrElse(OSMType.WAY, List.empty)
     val relations = grouping.getOrElse(OSMType.RELATION, List.empty)
 
     val results = for {
-      nodes <- nodeService.get(nodes.map(_.osmId))
-      ways <- wayService.get(ways.map(_.osmId))
+      nodes     <- nodeService.get(nodes.map(_.osmId))
+      ways      <- wayService.get(ways.map(_.osmId))
       relations <- relationService.get(relations.map(_.osmId))
     } yield (nodes, ways, relations)
 
@@ -130,9 +209,10 @@ class ChangesetProvider @Inject()(ws: WSClient, nodeService: NodeProvider, waySe
             None
           } else {
             val deletedTags = feature.tags.filter(k => change.deletes.contains(k._1))
-            val addedTags = mutable.Map[String, String]()
+            val addedTags   = mutable.Map[String, String]()
             val updatedTags = mutable.Map[String, (String, String)]()
-            val mutableTags: mutable.Map[String, String] = mutable.Map(feature.tags.filter(k => !change.deletes.contains(k._1)).toSeq: _*)
+            val mutableTags: mutable.Map[String, String] =
+              mutable.Map(feature.tags.filter(k => !change.deletes.contains(k._1)).toSeq: _*)
             change.updates.foreach(up => {
               if (!mutableTags.contains(up._1)) {
                 addedTags.put(up._1, up._2)
@@ -141,10 +221,16 @@ class ChangesetProvider @Inject()(ws: WSClient, nodeService: NodeProvider, waySe
               }
               mutableTags.put(up._1, up._2)
             })
-            val tagChangeResult = TagChangeResult(feature.id, feature.getOSMType, addedTags.toMap, updatedTags.toMap, deletedTags)
+            val tagChangeResult = TagChangeResult(
+              feature.id,
+              feature.getOSMType,
+              addedTags.toMap,
+              updatedTags.toMap,
+              deletedTags
+            )
             feature match {
-              case x: VersionedNode => Some(x.copy(tags = mutableTags.toMap), tagChangeResult)
-              case x: VersionedWay => Some(x.copy(tags = mutableTags.toMap), tagChangeResult)
+              case x: VersionedNode     => Some(x.copy(tags = mutableTags.toMap), tagChangeResult)
+              case x: VersionedWay      => Some(x.copy(tags = mutableTags.toMap), tagChangeResult)
               case x: VersionedRelation => Some(x.copy(tags = mutableTags.toMap), tagChangeResult)
             }
           }
@@ -172,17 +258,29 @@ class ChangesetProvider @Inject()(ws: WSClient, nodeService: NodeProvider, waySe
         </changeset>
       </osm>
     implicit val url = s"${config.getOSMServer}/api/0.6/changeset/create"
-    implicit val req = ws.url(url).sign(OAuthCalculator(config.getOSMOauth.consumerKey, accessToken)).put(newChangeSet)
-    this.checkResult[Int] { response => response.body.toInt }
+    implicit val req = ws
+      .url(url)
+      .sign(OAuthCalculator(config.getOSMOauth.consumerKey, accessToken))
+      .put(newChangeSet)
+    this.checkResult[Int] { response =>
+      response.body.toInt
+    }
   }
 
-  private def checkResult[T](block: WSResponse => T)(implicit req: Future[WSResponse], url: String): Future[T] = {
+  private def checkResult[T](
+      block: WSResponse => T
+  )(implicit req: Future[WSResponse], url: String): Future[T] = {
     val p = Promise[T]
     req onComplete {
-      case Success(res) => res.status match {
-        case ChangesetProvider.STATUS_OK => p success block(res)
-        case x => p failure new Exception(s"${url} failed with status code $x (${res.statusText}")
-      }
+      case Success(res) =>
+        res.status match {
+          case ChangesetProvider.STATUS_OK => p success block(res)
+          case ChangesetProvider.STATUS_UNAUTHORIZED =>
+            p failure new OAuthNotAuthorizedException(
+              s"User not authorized to submit tag changes on this server. $res"
+            )
+          case x => p failure new Exception(s"${url} failed with status code $x (${res.statusText}")
+        }
       case Failure(f) => p failure f
     }
     p.future
@@ -197,8 +295,11 @@ class ChangesetProvider @Inject()(ws: WSClient, nodeService: NodeProvider, waySe
     */
   private def closeChangeset(changesetId: Int, accessToken: RequestToken): Future[Boolean] = {
     implicit val url = s"${config.getOSMServer}/api/0.6/changeset/$changesetId/close"
-    implicit val req = ws.url(url).sign(OAuthCalculator(config.getOSMOauth.consumerKey, accessToken)).put("")
-    this.checkResult[Boolean] { response => true }
+    implicit val req =
+      ws.url(url).sign(OAuthCalculator(config.getOSMOauth.consumerKey, accessToken)).put("")
+    this.checkResult[Boolean] { response =>
+      true
+    }
   }
 }
 
@@ -208,6 +309,7 @@ object ChangesetProvider {
   // 1 - Requested Tag change is the same as the current version
   // 2 - Change for requested Tag is potentially invalid based on wiki specs
 
-  private val STATUS_OK = 200
-  private val STATUS_CONFLICT = 409
+  private val STATUS_OK           = 200
+  private val STATUS_CONFLICT     = 409
+  private val STATUS_UNAUTHORIZED = 401
 }
